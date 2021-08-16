@@ -1,5 +1,6 @@
 use std::net::Ipv4Addr;
 use structopt::StructOpt;
+use std::collections::HashMap;
 use pnet::packet::ip::{IpNextHeaderProtocol, IpNextHeaderProtocols};
 use pnet::packet::ipv4::{Ipv4Packet,MutableIpv4Packet, checksum};
 use pnet::packet::udp::{MutableUdpPacket,ipv4_checksum};
@@ -30,6 +31,58 @@ impl State {
     }
 }
 
+const QUERIES_START: usize = 12;
+       
+const QTYPES_MAP: [(i32, &str); 47] = [
+    (1, "A"),
+    (2, "NS"),
+    (5, "CNAME"),
+    (6, "SOA"),
+    (12, "PTR"),
+    (13, "HINFO"),
+    (15, "MX"),
+    (16, "TXT"),
+    (17, "RP"),
+    (18, "AFSDB"),
+    (24, "SIG"),
+    (25, "KEY"),
+    (28, "AAAA"),
+    (29, "LOC"),
+    (33, "SRV"),
+    (35, "NAPTR"),
+    (36, "KX"),
+    (37, "CERT"),
+    (39, "DNAME"),
+    (42, "APL"),
+    (43, "DS"),
+    (44, "SSHFP"),
+    (45, "IPSECKEY"),
+    (46, "RRSIG"),
+    (47, "NSEC"),
+    (48, "DNSKEY"),
+    (49, "DHCID"),
+    (50, "NSEC3"),
+    (51, "NSEC3PARAM"),
+    (52, "TLSA"),
+    (53, "SMIMEA"),
+    (55, "HIP"),
+    (59, "CDS"),
+    (60, "CDNSKEY"),
+    (61, "OPENPGPKEY"),
+    (62, "CSYNC"),
+    (63, "ZONEMD"),
+    (64, "SVCB"),
+    (65, "HTTPS"),
+    (108, "EUI48"),
+    (109, "EUI64"),
+    (249, "TKEY"),
+    (250, "TSIG"),
+    (256, "URI"),
+    (257, "CAA"),
+    (32768, "TA"),
+    (32769, "DLV")
+];
+
 fn validate_ipv4(ipv4address: String) -> [u8; 4] {
     // Validate passed arg against IPv4. Returns array with 4 octets or terminates program
     let ipv4 = ipv4address.parse::<Ipv4Addr>();
@@ -54,7 +107,7 @@ fn guess_if_dns(udp_data: &[u8], udp_port: u16) -> bool {
     // - Destination Port
     // - Length
     // - Checksum
-    // Then comes the payload. Values stored in "udp_data" are decimal.
+    // Then comes the payload processed here. Values stored in "udp_data" are `u8` integers.
 
     // Check if "Response" QR bit of DNS packet is set (1st bit)
     if (udp_data[2] ^ 128) > 128 {
@@ -71,14 +124,133 @@ fn guess_if_dns(udp_data: &[u8], udp_port: u16) -> bool {
         return false
     }
 
+    // Does it have at least 1 answer?
+    // What about unresolved domains?
+    // if udp_data[6]+udp_data[7] == 0 {
+    //     return false
+    // }
+
     // All checks passed, we hope it's DNS
     true
+}
+
+fn print_domain(domain: Vec<u8>) {
+    let mut s: String = String::from("");
+    for c in domain {
+        s.push(c as char);
+    }
+    println!("{}",s);
+}
+
+fn print_query_type(first_byte: Option<&u8>, second_byte: Option<&u8>, qtypes: &HashMap<i32, &str>) -> bool {
+    // Extract DNS query/response type from the static list. `first_byte` remains here as 'todo' in case
+    // that TA/DLV types would be required to be handled.
+    //
+    // TODO: Returns `true` if type is A, `false` otherwise, as other types require individual processing.
+    match second_byte {
+        Some(&a) => {
+            
+            let ai32 = a as i32;
+            match qtypes.get(&ai32) {
+                Some(b) => {
+                    if ai32 == 1 {
+                        println!("Type: {}", b);
+                        return true
+                    }
+                    else {
+                        println!("Type: {} - not implemented", b);
+                        return false
+                    }
+                },
+                None => {
+                    println!("Unknown type: {}",a);
+                    return false
+                }
+            }
+        },
+        None => false
+    }
+}
+
+fn substitute_addr(payload: std::vec::Vec<u8>, new_ipv4_addr: [u8; 4], qtypes: HashMap<i32, &str>) -> Option<std::vec::Vec<u8>> {
+    // Resolved IP address position in payload depends on for example the length
+    // of the domain queried. We will have to calculate this position first, then
+    // substitute the address.
+
+    // let questions_no = payload[4]+payload[5];
+    // let answers_no = payload[6]+payload[7];
+    let mut payload_iter = payload.iter().skip(QUERIES_START);
+
+    // Query part
+    let mut queried_domain: Vec<u8> = Vec::new();
+    let mut queried_domain_len: usize = 1; // dummy value >0
+    while queried_domain_len != 0 {
+        // Extract queried domain name
+        match payload_iter.next() {
+            Some(&v) => {
+                queried_domain_len = usize::from(v);
+            }
+            None => ()
+        }
+
+        for _ in 0..queried_domain_len {
+            match payload_iter.next() {
+                Some(&c) => {
+                    queried_domain.push(c);
+                }
+                None => ()
+            }
+        }
+        if queried_domain_len > 0 { queried_domain.push(46); } // a dot
+    }
+    println!("------\nRequest");
+    print_domain(queried_domain);
+    print_query_type(payload_iter.next(), payload_iter.next(), &qtypes);
+    payload_iter.next(); // Skip query Class (2 bytes)
+    payload_iter.next();
+
+    println!("\nResponse");
+    payload_iter.next(); // Skip response Name pointer (2 bytes)
+    payload_iter.next();
+    if !print_query_type(payload_iter.next(), payload_iter.next(), &qtypes) {
+        // Unsupported query/response type
+        return None
+    }
+    payload_iter.next(); // Skip response Class (2 bytes)
+    payload_iter.next();
+    payload_iter.next(); // Skip response TTL (4 bytes)
+    payload_iter.next();
+    payload_iter.next();
+    payload_iter.next();
+    payload_iter.next(); // Skip data length (2 bytes)
+    payload_iter.next();
+    
+    // println!("Packet is: {:02x?}", payload);
+    // Find out current index and substitute IP address
+    let itersize = payload_iter.size_hint();
+    let mut new_dns_body = payload.to_owned();
+    new_dns_body[payload.len()-itersize.0] = new_ipv4_addr[0];
+    new_dns_body[payload.len()-itersize.0+1] = new_ipv4_addr[1];
+    new_dns_body[payload.len()-itersize.0+2] = new_ipv4_addr[2];
+    new_dns_body[payload.len()-itersize.0+3] = new_ipv4_addr[3];
+    println!("{}.{}.{}.{} -> {}.{}.{}.{}",
+        payload[payload.len()-itersize.0],
+        payload[payload.len()-itersize.0+1],
+        payload[payload.len()-itersize.0+2],
+        payload[payload.len()-itersize.0+3],
+        new_ipv4_addr[0],
+        new_ipv4_addr[1],
+        new_ipv4_addr[2],
+        new_ipv4_addr[3]
+    );
+    
+    Some(new_dns_body)
 }
 
 // TODO: TCP handling
 // fn handle_tcp_packet(id: u32, source: Ipv4Addr, destination: Ipv4Addr, packet: &[u8]) -> MutableTcpPacket {}
 
-fn handle_udp_packet(id: u32, source: Ipv4Addr, destination: Ipv4Addr, packet: &[u8], new_ipv4_address: [u8; 4]) -> Option<MutableUdpPacket> {
+fn handle_udp_packet<'a>(id: u32, source: Ipv4Addr, destination: Ipv4Addr, packet: &'a[u8], new_ipv4_address: [u8; 4], qtypes: HashMap<i32, &str>) -> Option<MutableUdpPacket<'a>> {
     let mut s_packet_data = packet.to_owned();
     let ms_packet_data = s_packet_data.as_mut_slice();
     let udp = MutableUdpPacket::new(ms_packet_data);
@@ -98,31 +270,24 @@ fn handle_udp_packet(id: u32, source: Ipv4Addr, destination: Ipv4Addr, packet: &
             return MutableUdpPacket::new(&mut [])
         };
 
-        // Substitue IP address here:
-        let mut new_dns_body = u.payload().to_owned();
-        // println!("Packet is: {:02x?}", new_dns_body);
-        // println!("Port is {}",u.get_source()); // skip 16 bytes, then first (count from 0)
-        // new_dns_body[length_before-1] = new_ipv4_address[3];
-        // new_dns_body[length_before-2] = new_ipv4_address[2];
-        // new_dns_body[length_before-3] = new_ipv4_address[1];
-        // new_dns_body[length_before-4] = new_ipv4_address[0];
-        new_dns_body[40] = new_ipv4_address[3];
-        new_dns_body[39] = new_ipv4_address[2];
-        new_dns_body[38] = new_ipv4_address[1];
-        new_dns_body[37] = new_ipv4_address[0];
-        // new_dns_body[41] = 41;
-        // new_dns_body[42] = 41;
+        // Do actual substitutions here and obtain new body to return
+        match substitute_addr(u.payload().to_owned(), new_ipv4_address, qtypes) {
+            Some(mut new_dns_body) => {
+                // Prepare new UDP packet and fill header with previous data
+                let mut nudp = MutableUdpPacket::owned(new_data).unwrap();
+                nudp.set_source(u.get_source());
+                nudp.set_destination(u.get_destination());
+                nudp.set_length(u.get_length());
+                nudp.set_payload(&mut new_dns_body[..]);
+                // Possible to skip below by hardcoding static 0x0 value, should work as per RFC 768
+                nudp.set_checksum(ipv4_checksum(&nudp.to_immutable(), &source, &destination));
+        
+                Some(nudp)
+            },
+            // Return empty data if Response Type not implemented
+            None => MutableUdpPacket::new(&mut[])
+        }
 
-        // Prepare new UDP packet and fill header with previous data
-        let mut nudp = MutableUdpPacket::owned(new_data).unwrap();
-        nudp.set_source(u.get_source());
-        nudp.set_destination(u.get_destination());
-        nudp.set_length(u.get_length());
-        nudp.set_payload(&mut new_dns_body[..]);
-        // Can skip checksum by hardcoding static 0x0 value, should work as per RFC 768
-        nudp.set_checksum(ipv4_checksum(&nudp.to_immutable(), &source, &destination));
-
-        Some(nudp)
     } else {
         println!("[{}]: Malformed UDP Packet", id);
         MutableUdpPacket::new(&mut[])
@@ -130,17 +295,18 @@ fn handle_udp_packet(id: u32, source: Ipv4Addr, destination: Ipv4Addr, packet: &
 }
 
 
-fn handle_transport_protocol(
+fn handle_transport_protocol<'a>(
     id: u32,
     source: Ipv4Addr,
     destination: Ipv4Addr,
     protocol: IpNextHeaderProtocol,
-    packet: &[u8],
-    new_ipv4_address: [u8; 4]
-) -> Option<MutableUdpPacket> {
+    packet: &'a[u8],
+    new_ipv4_address: [u8; 4],
+    qtypes: HashMap<i32, &str>
+) -> Option<MutableUdpPacket<'a>> {
     match protocol {
         IpNextHeaderProtocols::Udp => {
-            handle_udp_packet(id, source, destination, packet, new_ipv4_address)
+            handle_udp_packet(id, source, destination, packet, new_ipv4_address, qtypes)
         },
         // IpNextHeaderProtocols::Tcp => handle_tcp_packet(id, source, destination, packet),
         _ => {
@@ -158,10 +324,10 @@ fn handle_transport_protocol(
 }
 
 
-fn callback(msg: &nfqueue::Message, custom_data: &mut (State, [u8; 4])) {
-    let (state, new_ipv4_address) = custom_data;
+fn callback(msg: &nfqueue::Message, custom_data: &mut (State, [u8; 4], HashMap<i32, &str>)) {
+    let (state, new_ipv4_address, qtypes) = custom_data;
     state.count += 1;
-    println!(" -> {} msg: {}", msg.get_id(), msg);
+    // println!(" -> {} msg: {}", msg.get_id(), msg);
 
     let header = Ipv4Packet::new(msg.get_payload());
     match header {
@@ -172,7 +338,8 @@ fn callback(msg: &nfqueue::Message, custom_data: &mut (State, [u8; 4])) {
                 h.get_destination(),
                 h.get_next_level_protocol(),
                 h.payload(),
-                new_ipv4_address.to_owned()
+                new_ipv4_address.to_owned(),
+                qtypes.to_owned()
             );
 
             match returned {
@@ -214,9 +381,10 @@ fn callback(msg: &nfqueue::Message, custom_data: &mut (State, [u8; 4])) {
 }
 
 fn main() {
+    let qtypes: HashMap<i32, &str> = QTYPES_MAP.iter().cloned().collect();
     let opt = Opt::from_args();
     let new_ipv4_address = validate_ipv4(opt.ipv4address);  
-    let mut q = nfqueue::Queue::new((State::new(), new_ipv4_address));
+    let mut q = nfqueue::Queue::new((State::new(), new_ipv4_address, qtypes));
     q.open();
     let rc = q.bind(libc::AF_INET);
     assert!(rc==0);
