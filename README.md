@@ -11,20 +11,15 @@ Requires CAP_NET_ADMIN on Linux, for testing can be quickly granted with simple 
 
 ## How to:
 
-Step 1) create new nfqueue on INPUT traffic. Choose `--source` address (DNS server address), choose arbitrary queue ID (`--queue-num`):
+Step 1) run dns-rewriter. Pass `-t` (IPv4 address) that will be included in DNS responses and `-s` for the DNS server address that will be answering the query:
 
-    sudo iptables -A INPUT --source 9.9.9.9 -j NFQUEUE --queue-num 5
+    sudo dns-rewriter -t 1.2.3.4 -s 9.9.9.9
 
-Step 2) run dns-rewriter. Pass `-i` (IPv4 address) that will be included in DNS responses and previous `-q`ueue number:
-
-    sudo dns-rewriter -i 1.2.3.4 -q 5
-
-Step 3) test with some DNS tool like dig or nslookup:
+Step 2) test with some DNS tool like dig or nslookup:
 
     nslookup example.com @9.9.9.9
 
-
-Step 4) observe modified responses:
+Step 3) observe modified responses:
 
     [user@linux ~]$ nslookup example.com 9.9.9.9
     Server:         9.9.9.9
