@@ -7,17 +7,18 @@ use pnet::packet::udp::{MutableUdpPacket,ipv4_checksum};
 use pnet::packet::Packet;
 extern crate nfqueue;
 extern crate libc;
+extern crate iptables;
 
 #[derive(StructOpt, Debug)]
 #[structopt()]
 struct Opt {
     /// IPv4 address to be set in the DNS response
-    #[structopt(short="i")]
-    ipv4address: String,
+    #[structopt(short="t")]
+    target_ipaddr: String,
 
-    /// nfqueue ID
-    #[structopt(short="q")]
-    queue: u16
+    // IPv4 address of the source DNS server
+    #[structopt(short="s")]
+    source_ipaddr: String    
 }
 
 struct State {
@@ -380,16 +381,42 @@ fn callback(msg: &nfqueue::Message, custom_data: &mut (State, [u8; 4], HashMap<i
     }
 }
 
+fn set_queue(ipt: iptables::IPTables, addr: &[u8; 4]) -> Option<u16> {
+    // Creates a new queue. ID of the queue (the `--queue-num` parameter in
+    // iptables) is the first one that is free, up to possible 65535 (16 bits)
+    //
+    // Todo: Cleanup after terminating the program
+    let mut options;
+    for i in 1..65535 as u16 {
+        options = format!("--source {}.{}.{}.{} -j NFQUEUE --queue-num {}", addr[0],addr[1],addr[2],addr[3], i);
+        if !ipt.exists("filter", "INPUT", options.as_str()).unwrap() {
+            ipt.append("filter", "INPUT", options.as_str()).unwrap();
+            return Some(i)
+        }
+    }
+    return None;
+}
+
 fn main() {
-    let qtypes: HashMap<i32, &str> = QTYPES_MAP.iter().cloned().collect();
     let opt = Opt::from_args();
-    let new_ipv4_address = validate_ipv4(opt.ipv4address);  
-    let mut q = nfqueue::Queue::new((State::new(), new_ipv4_address, qtypes));
-    q.open();
-    let rc = q.bind(libc::AF_INET);
-    assert!(rc==0);
-    q.create_queue(opt.queue, callback);
-    q.set_mode(nfqueue::CopyMode::CopyPacket, 0xffffff);
-    q.run_loop();
-    q.close();
+    let target_ipv4_address = validate_ipv4(opt.target_ipaddr);
+    let source_ipv4_address = validate_ipv4(opt.source_ipaddr);
+
+    let ipt = iptables::new(false).unwrap();
+    match set_queue(ipt, &source_ipv4_address) {
+        Some(queue_num) => {
+            let qtypes: HashMap<i32, &str> = QTYPES_MAP.iter().cloned().collect();
+            let mut q = nfqueue::Queue::new((State::new(), target_ipv4_address, qtypes));
+            q.open();
+            let rc = q.bind(libc::AF_INET);
+            assert!(rc==0);
+            q.create_queue(queue_num, callback);
+            q.set_mode(nfqueue::CopyMode::CopyPacket, 0xffffff);
+            q.run_loop();
+            q.close();
+        },
+        None => {
+            println!("Couldn't create new netfilter queue.")
+        }
+    }   
 }
