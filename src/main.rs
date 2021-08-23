@@ -398,7 +398,8 @@ fn set_queue(ipt: &iptables::IPTables, addr: &[u8; 4]) -> Option<u16> {
     return None;
 }
 
-fn cleanup_queue(ipt: &iptables::IPTables, addr: &[u8; 4], queue_num: u16) {
+fn cleanup_queue(addr: &[u8; 4], queue_num: u16) {
+    let ipt = iptables::new(false).unwrap();
     let options = format!("--source {}.{}.{}.{} -j NFQUEUE --queue-num {}", addr[0],addr[1],addr[2],addr[3], queue_num);
     println!("Cleaning up {}", options);
     if ipt.exists("filter", "INPUT", options.as_str()).unwrap() {
@@ -409,47 +410,62 @@ fn cleanup_queue(ipt: &iptables::IPTables, addr: &[u8; 4], queue_num: u16) {
     }
 }
 
+fn register_signals(addr: [u8; 4], queue_num: u16) -> Result<(), Error> {
+    // Listen for signals, then clean up iptables rule on exit
+    let mut signals = signal_hook::iterator::Signals::new(&[
+        signal_hook::consts::SIGINT, // ctrl+c
+        signal_hook::consts::SIGQUIT,
+        signal_hook::consts::SIGTERM
+        ])?;
+    
+    thread::spawn(move || {
+        for sig in signals.forever() {
+            println!("Received signal {:?}", sig);
+            match sig {
+                2 | 3 | 15 => {
+                    // SIGINT, SIGQUIT, SIGTERM
+                    cleanup_queue(&addr.to_owned(), queue_num);
+                    std::process::exit(0)
+                },
+                _ => {
+                    println!("Doing nothing");
+                }
+            }
+        }
+    });
+
+    Ok(())
+}
+
 fn main() -> Result<(), Error> {
     let opt = Opt::from_args();
     let target_ipv4_address = validate_ipv4(opt.target_ipaddr);
     let source_ipv4_address = validate_ipv4(opt.source_ipaddr);
-
     let ipt = iptables::new(false).unwrap();
-    match set_queue(&ipt, &source_ipv4_address) {
+    let queue_num = set_queue(&ipt, &source_ipv4_address);
+    
+    match queue_num {
         Some(queue_num) => {
-            // First set signal handlers, so iptables rules are cleaned up on exit
-            let mut signals = signal_hook::iterator::Signals::new(&[
-                signal_hook::consts::SIGINT,
-                signal_hook::consts::SIGTERM,
-                signal_hook::consts::SIGQUIT
-                ])?;
-            thread::spawn(move || {
-                for sig in signals.forever() {
-                    println!("Received signal {:?}", sig);
-                    match sig {
-                        2 | 3 | 15 => {
-                            cleanup_queue(&ipt, &source_ipv4_address, queue_num);
-                            std::process::exit(0)
-                        },
-                        _ => {
-                            println!("Doing nothing");
-                        }
-                    }
+            match register_signals(source_ipv4_address, queue_num) {
+                Ok(()) => {
+                    let qtypes: HashMap<i32, &str> = QTYPES_MAP.iter().cloned().collect();
+                    let mut q = nfqueue::Queue::new((State::new(), target_ipv4_address.to_owned(), qtypes));
+                    q.open();
+                    let rc = q.bind(libc::AF_INET);
+                    assert!(rc==0);
+                    q.create_queue(queue_num, callback);
+                    q.set_mode(nfqueue::CopyMode::CopyPacket, 0xffffff);
+                    q.run_loop();
+                    q.close();
+                },
+                _ => {
+                    println!("Error registering signals");
+                    std::process::exit(1)                    
                 }
-            });
-            // Then create and run actual processing
-            let qtypes: HashMap<i32, &str> = QTYPES_MAP.iter().cloned().collect();
-            let mut q = nfqueue::Queue::new((State::new(), target_ipv4_address, qtypes));
-            q.open();
-            let rc = q.bind(libc::AF_INET);
-            assert!(rc==0);
-            q.create_queue(queue_num, callback);
-            q.set_mode(nfqueue::CopyMode::CopyPacket, 0xffffff);
-            q.run_loop();
-            q.close();
+            }
         },
         None => {
-            println!("Couldn't create new netfilter queue.");
+            println!("Couldn't create new netfilter queue");
             std::process::exit(1)
         }
     }
