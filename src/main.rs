@@ -418,12 +418,16 @@ fn main() -> Result<(), Error> {
     match set_queue(&ipt, &source_ipv4_address) {
         Some(queue_num) => {
             // First set signal handlers, so iptables rules are cleaned up on exit
-            let mut signals = signal_hook::iterator::Signals::new(&[signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM])?;
+            let mut signals = signal_hook::iterator::Signals::new(&[
+                signal_hook::consts::SIGINT,
+                signal_hook::consts::SIGTERM,
+                signal_hook::consts::SIGQUIT
+                ])?;
             thread::spawn(move || {
                 for sig in signals.forever() {
                     println!("Received signal {:?}", sig);
                     match sig {
-                        2 | 15 => {
+                        2 | 3 | 15 => {
                             cleanup_queue(&ipt, &source_ipv4_address, queue_num);
                             std::process::exit(0)
                         },
