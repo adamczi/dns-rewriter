@@ -1,6 +1,8 @@
 use std::net::Ipv4Addr;
-use structopt::StructOpt;
 use std::collections::HashMap;
+use std::io::Error;
+use std::thread;
+use structopt::StructOpt;
 use pnet::packet::ip::{IpNextHeaderProtocol, IpNextHeaderProtocols};
 use pnet::packet::ipv4::{Ipv4Packet,MutableIpv4Packet, checksum};
 use pnet::packet::udp::{MutableUdpPacket,ipv4_checksum};
@@ -8,6 +10,7 @@ use pnet::packet::Packet;
 extern crate nfqueue;
 extern crate libc;
 extern crate iptables;
+extern crate signal_hook;
 
 #[derive(StructOpt, Debug)]
 #[structopt()]
@@ -381,11 +384,9 @@ fn callback(msg: &nfqueue::Message, custom_data: &mut (State, [u8; 4], HashMap<i
     }
 }
 
-fn set_queue(ipt: iptables::IPTables, addr: &[u8; 4]) -> Option<u16> {
+fn set_queue(ipt: &iptables::IPTables, addr: &[u8; 4]) -> Option<u16> {
     // Creates a new queue. ID of the queue (the `--queue-num` parameter in
     // iptables) is the first one that is free, up to possible 65535 (16 bits)
-    //
-    // Todo: Cleanup after terminating the program
     let mut options;
     for i in 1..65535 as u16 {
         options = format!("--source {}.{}.{}.{} -j NFQUEUE --queue-num {}", addr[0],addr[1],addr[2],addr[3], i);
@@ -397,14 +398,42 @@ fn set_queue(ipt: iptables::IPTables, addr: &[u8; 4]) -> Option<u16> {
     return None;
 }
 
-fn main() {
+fn cleanup_queue(ipt: &iptables::IPTables, addr: &[u8; 4], queue_num: u16) {
+    let options = format!("--source {}.{}.{}.{} -j NFQUEUE --queue-num {}", addr[0],addr[1],addr[2],addr[3], queue_num);
+    println!("Cleaning up {}", options);
+    if ipt.exists("filter", "INPUT", options.as_str()).unwrap() {
+        ipt.delete("filter", "INPUT", options.as_str()).unwrap();
+    }
+    else {
+        println!("nfqueue: INPUT filter not found, clean it up yourself: \"iptables -D INPUT {}\"", options);
+    }
+}
+
+fn main() -> Result<(), Error> {
     let opt = Opt::from_args();
     let target_ipv4_address = validate_ipv4(opt.target_ipaddr);
     let source_ipv4_address = validate_ipv4(opt.source_ipaddr);
 
     let ipt = iptables::new(false).unwrap();
-    match set_queue(ipt, &source_ipv4_address) {
+    match set_queue(&ipt, &source_ipv4_address) {
         Some(queue_num) => {
+            // First set signal handlers, so iptables rules are cleaned up on exit
+            let mut signals = signal_hook::iterator::Signals::new(&[signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM])?;
+            thread::spawn(move || {
+                for sig in signals.forever() {
+                    println!("Received signal {:?}", sig);
+                    match sig {
+                        2 | 15 => {
+                            cleanup_queue(&ipt, &source_ipv4_address, queue_num);
+                            std::process::exit(0)
+                        },
+                        _ => {
+                            println!("Doing nothing");
+                        }
+                    }
+                }
+            });
+            // Then create and run actual processing
             let qtypes: HashMap<i32, &str> = QTYPES_MAP.iter().cloned().collect();
             let mut q = nfqueue::Queue::new((State::new(), target_ipv4_address, qtypes));
             q.open();
@@ -416,7 +445,9 @@ fn main() {
             q.close();
         },
         None => {
-            println!("Couldn't create new netfilter queue.")
+            println!("Couldn't create new netfilter queue.");
+            std::process::exit(1)
         }
-    }   
+    }
+    Ok(())
 }
