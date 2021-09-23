@@ -21,12 +21,12 @@ struct Opt {
     #[structopt(short="t")]
     target_ipaddr: String,
 
-    // IPv4 address of the source DNS server
+    /// IPv4 address of the source DNS server
     #[structopt(short="s")]
     source_ipaddr: String,
 
-    // Verbose mode
-    #[structopt(short="v")]
+    /// Verbose mode. When not verbose '.' (dot) means non-DNS packet and 'X' means unhandled DNS packet
+    #[structopt(short="v", long="verbose")]
     verbose: bool
 }
 
@@ -214,8 +214,8 @@ fn substitute_addr(payload: std::vec::Vec<u8>, new_ipv4_addr: [u8; 4], qtypes: H
     // of the domain queried. We will have to calculate this position first, then
     // substitute the address.
 
-    // let questions_no = payload[4]+payload[5];
-    // let answers_no = payload[6]+payload[7];
+    // let questions_no = payload[4]+payload[5]; // number of DNS queries (usually 1?)
+    let answers_no = payload[6]+payload[7]; // number of answers in "A" response (TODO: can be more than 1)
     let mut payload_iter = payload.iter().skip(QUERIES_START);
 
     // Query part
@@ -246,6 +246,16 @@ fn substitute_addr(payload: std::vec::Vec<u8>, new_ipv4_addr: [u8; 4], qtypes: H
     let response_qt: (bool, String) = get_query_type(payload_iter.next(), payload_iter.next(), &qtypes);
     if !response_qt.0 {
         // Unsupported query/response type
+        if answers_no == 0 {
+            // TODO: handle NXDOMAIN to represent valid response
+            if Opt::from_args().verbose {
+                println!("{}", response_qt.1);
+            }
+            else {
+                print!("X");
+                io::stdout().flush().unwrap();
+            }
+        }
         return None
     }
     payload_iter.next(); // Skip response Class (2 bytes)
@@ -311,7 +321,6 @@ fn handle_udp_packet<'a>(id: u32, source: Ipv4Addr, destination: Ipv4Addr, packe
                 nudp.set_payload(&new_dns_body[..]);
                 // Possible to skip below by hardcoding static 0x0 value, should work as per RFC 768
                 nudp.set_checksum(ipv4_checksum(&nudp.to_immutable(), &source, &destination));
-        
                 Some(nudp)
             },
             // Return empty data if Response Type not implemented
