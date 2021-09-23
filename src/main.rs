@@ -144,7 +144,7 @@ fn guess_if_dns(udp_data: &[u8], udp_port: u16) -> bool {
     true
 }
 
-fn print_domain(domain: &Vec<u8>) {
+fn print_domain(domain: &[u8]) {
     let mut s: String = String::from("");
     for c in domain {
         s.push(*c as char);
@@ -164,28 +164,28 @@ fn get_query_type(_first_byte: Option<&u8>, second_byte: Option<&u8>, qtypes: &H
                 Some(b) => {
                     if ai32 == 1 {
                         let msg = format!("Type: {}", b);
-                        return (true, msg)
+                        (true, msg)
                     }
                     else {
                         let msg = format!("Type: {} - not implemented", b);
-                        return (false, msg)
+                        (false, msg)
                     }
                 },
                 None => {
                     let msg = format!("Unknown type: {}",a);
-                    return (false, msg)
+                    (false, msg)
                 }
             }
         },
-        None => (false, format!("Query Type byte is null"))
+        None => (false, "Query Type byte is null".to_string())
     }
 }
 
 fn print_packet(
-    queried_domain: &Vec<u8>,
-    req_qt_msg: &String,
-    resp_qt_msg: &String,
-    payload: &std::vec::Vec<u8>,
+    queried_domain: &[u8],
+    req_qt_msg: &str,
+    resp_qt_msg: &str,
+    payload: &[u8],
     new_ipv4_addr: &[u8; 4],
     itersize: &(usize, Option<usize>)
 ) {
@@ -223,20 +223,16 @@ fn substitute_addr(payload: std::vec::Vec<u8>, new_ipv4_addr: [u8; 4], qtypes: H
     let mut queried_domain_len: usize = 1; // dummy value >0
     while queried_domain_len != 0 {
         // Extract queried domain name
-        match payload_iter.next() {
-            Some(&v) => {
-                queried_domain_len = usize::from(v);
-            }
-            None => ()
+        if let Some(&v) = payload_iter.next() {
+            queried_domain_len = usize::from(v);
         }
+        else {}
 
         for _ in 0..queried_domain_len {
-            match payload_iter.next() {
-                Some(&c) => {
-                    queried_domain.push(c);
-                }
-                None => ()
+            if let Some(&c) = payload_iter.next() {
+                queried_domain.push(c);
             }
+            else {}
         }
         if queried_domain_len > 0 { queried_domain.push(46); } // a dot
     }
@@ -306,13 +302,13 @@ fn handle_udp_packet<'a>(id: u32, source: Ipv4Addr, destination: Ipv4Addr, packe
 
         // Do actual substitutions here and obtain new body to return
         match substitute_addr(u.payload().to_owned(), new_ipv4_address, qtypes) {
-            Some(mut new_dns_body) => {
+            Some(new_dns_body) => {
                 // Prepare new UDP packet and fill header with previous data
                 let mut nudp = MutableUdpPacket::owned(new_data).unwrap();
                 nudp.set_source(u.get_source());
                 nudp.set_destination(u.get_destination());
                 nudp.set_length(u.get_length());
-                nudp.set_payload(&mut new_dns_body[..]);
+                nudp.set_payload(&new_dns_body[..]);
                 // Possible to skip below by hardcoding static 0x0 value, should work as per RFC 768
                 nudp.set_checksum(ipv4_checksum(&nudp.to_immutable(), &source, &destination));
         
@@ -358,7 +354,7 @@ fn handle_transport_protocol<'a>(
                 print!(".");
                 io::stdout().flush().unwrap();
             }
-            return MutableUdpPacket::new(&mut[])
+            MutableUdpPacket::new(&mut[])
         },
     }
 }
@@ -423,14 +419,14 @@ fn set_queue(ipt: &iptables::IPTables, addr: &[u8; 4]) -> Option<u16> {
     // Creates a new queue. ID of the queue (the `--queue-num` parameter in
     // iptables) is the first one that is free, up to possible 65535 (16 bits)
     let mut options;
-    for i in 1..65535 as u16 {
+    for i in 1..65535_u16 {
         options = format!("--source {}.{}.{}.{} -j NFQUEUE --queue-num {}", addr[0],addr[1],addr[2],addr[3], i);
         if !ipt.exists("filter", "INPUT", options.as_str()).unwrap() {
             ipt.append("filter", "INPUT", options.as_str()).unwrap();
             return Some(i)
         }
     }
-    return None;
+    None
 }
 
 fn cleanup_queue(addr: &[u8; 4], queue_num: u16) {
@@ -472,7 +468,7 @@ fn register_signals(addr: [u8; 4], queue_num: u16) -> Result<(), Error> {
     Ok(())
 }
 
-fn main() -> Result<(), Error> {
+fn main() {
     let opt = Opt::from_args();
     let target_ipv4_address = validate_ipv4(opt.target_ipaddr);
     let source_ipv4_address = validate_ipv4(opt.source_ipaddr);
@@ -504,5 +500,4 @@ fn main() -> Result<(), Error> {
             std::process::exit(1)
         }
     }
-    Ok(())
 }
