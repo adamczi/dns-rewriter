@@ -1,3 +1,5 @@
+use std::io;
+use std::io::Write;
 use std::net::Ipv4Addr;
 use std::collections::HashMap;
 use std::io::Error;
@@ -21,7 +23,11 @@ struct Opt {
 
     // IPv4 address of the source DNS server
     #[structopt(short="s")]
-    source_ipaddr: String    
+    source_ipaddr: String,
+
+    // Verbose mode
+    #[structopt(short="v")]
+    verbose: bool
 }
 
 struct State {
@@ -138,42 +144,69 @@ fn guess_if_dns(udp_data: &[u8], udp_port: u16) -> bool {
     true
 }
 
-fn print_domain(domain: Vec<u8>) {
+fn print_domain(domain: &Vec<u8>) {
     let mut s: String = String::from("");
     for c in domain {
-        s.push(c as char);
+        s.push(*c as char);
     }
     println!("{}",s);
 }
 
-fn print_query_type(first_byte: Option<&u8>, second_byte: Option<&u8>, qtypes: &HashMap<i32, &str>) -> bool {
+fn get_query_type(_first_byte: Option<&u8>, second_byte: Option<&u8>, qtypes: &HashMap<i32, &str>) -> (bool, String) {
     // Extract DNS query/response type from the static list. `first_byte` remains here as 'todo' in case
     // that TA/DLV types would be required to be handled.
     //
     // TODO: Returns `true` if type is A, `false` otherwise, as other types require individual processing.
     match second_byte {
         Some(&a) => {
-            
             let ai32 = a as i32;
             match qtypes.get(&ai32) {
                 Some(b) => {
                     if ai32 == 1 {
-                        println!("Type: {}", b);
-                        return true
+                        let msg = format!("Type: {}", b);
+                        return (true, msg)
                     }
                     else {
-                        println!("Type: {} - not implemented", b);
-                        return false
+                        let msg = format!("Type: {} - not implemented", b);
+                        return (false, msg)
                     }
                 },
                 None => {
-                    println!("Unknown type: {}",a);
-                    return false
+                    let msg = format!("Unknown type: {}",a);
+                    return (false, msg)
                 }
             }
         },
-        None => false
+        None => (false, format!("Query Type byte is null"))
     }
+}
+
+fn print_packet(
+    queried_domain: &Vec<u8>,
+    req_qt_msg: &String,
+    resp_qt_msg: &String,
+    payload: &std::vec::Vec<u8>,
+    new_ipv4_addr: &[u8; 4],
+    itersize: &(usize, Option<usize>)
+) {
+    if Opt::from_args().verbose {
+        println!("------\nRequest");
+        print_domain(queried_domain);
+        println!("{}", req_qt_msg);
+        println!("\nResponse");
+        println!("{}", resp_qt_msg);
+
+    };
+    println!("{}.{}.{}.{} -> {}.{}.{}.{}",
+        payload[payload.len()-itersize.0],
+        payload[payload.len()-itersize.0+1],
+        payload[payload.len()-itersize.0+2],
+        payload[payload.len()-itersize.0+3],
+        new_ipv4_addr[0],
+        new_ipv4_addr[1],
+        new_ipv4_addr[2],
+        new_ipv4_addr[3]
+    );
 }
 
 fn substitute_addr(payload: std::vec::Vec<u8>, new_ipv4_addr: [u8; 4], qtypes: HashMap<i32, &str>) -> Option<std::vec::Vec<u8>> {
@@ -207,16 +240,15 @@ fn substitute_addr(payload: std::vec::Vec<u8>, new_ipv4_addr: [u8; 4], qtypes: H
         }
         if queried_domain_len > 0 { queried_domain.push(46); } // a dot
     }
-    println!("------\nRequest");
-    print_domain(queried_domain);
-    print_query_type(payload_iter.next(), payload_iter.next(), &qtypes);
+    let request_qt: (bool, String) = get_query_type(payload_iter.next(), payload_iter.next(), &qtypes);
     payload_iter.next(); // Skip query Class (2 bytes)
     payload_iter.next();
 
-    println!("\nResponse");
+    // Response part
     payload_iter.next(); // Skip response Name pointer (2 bytes)
     payload_iter.next();
-    if !print_query_type(payload_iter.next(), payload_iter.next(), &qtypes) {
+    let response_qt: (bool, String) = get_query_type(payload_iter.next(), payload_iter.next(), &qtypes);
+    if !response_qt.0 {
         // Unsupported query/response type
         return None
     }
@@ -229,7 +261,6 @@ fn substitute_addr(payload: std::vec::Vec<u8>, new_ipv4_addr: [u8; 4], qtypes: H
     payload_iter.next(); // Skip data length (2 bytes)
     payload_iter.next();
     
-    // println!("Packet is: {:02x?}", payload);
     // Find out current index and substitute IP address
     let itersize = payload_iter.size_hint();
     let mut new_dns_body = payload.to_owned();
@@ -237,15 +268,14 @@ fn substitute_addr(payload: std::vec::Vec<u8>, new_ipv4_addr: [u8; 4], qtypes: H
     new_dns_body[payload.len()-itersize.0+1] = new_ipv4_addr[1];
     new_dns_body[payload.len()-itersize.0+2] = new_ipv4_addr[2];
     new_dns_body[payload.len()-itersize.0+3] = new_ipv4_addr[3];
-    println!("{}.{}.{}.{} -> {}.{}.{}.{}",
-        payload[payload.len()-itersize.0],
-        payload[payload.len()-itersize.0+1],
-        payload[payload.len()-itersize.0+2],
-        payload[payload.len()-itersize.0+3],
-        new_ipv4_addr[0],
-        new_ipv4_addr[1],
-        new_ipv4_addr[2],
-        new_ipv4_addr[3]
+
+    print_packet(
+        &queried_domain,
+        &request_qt.1,
+        &response_qt.1,
+        &payload,
+        &new_ipv4_addr,
+        &itersize
     );
     
     Some(new_dns_body)
@@ -314,14 +344,20 @@ fn handle_transport_protocol<'a>(
         },
         // IpNextHeaderProtocols::Tcp => handle_tcp_packet(id, source, destination, packet),
         _ => {
-            println!(
-                "[{}]: Unknown packet: {} > {}; protocol: {:?} length: {}",
-                id,
-                source,
-                destination,
-                protocol,
-                packet.len()
-            );
+            if Opt::from_args().verbose {
+                println!(
+                    "[{}]: Unknown packet: {} > {}; protocol: {:?} length: {}",
+                    id,
+                    source,
+                    destination,
+                    protocol,
+                    packet.len()
+                );
+            }
+            else {
+                print!(".");
+                io::stdout().flush().unwrap();
+            }
             return MutableUdpPacket::new(&mut[])
         },
     }
@@ -372,7 +408,6 @@ fn callback(msg: &nfqueue::Message, custom_data: &mut (State, [u8; 4], HashMap<i
                     msg.set_verdict_full(nfqueue::Verdict::Accept, 1, &new_ipv4_packet.packet())
                 },
                 None => {
-                    println!("Accepting it");
                     msg.set_verdict(nfqueue::Verdict::Accept)
                 }
             }
