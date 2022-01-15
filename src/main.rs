@@ -23,7 +23,7 @@ struct Opt {
     #[structopt(short="t")]
     target_ipaddr: String,
 
-    /// IPv4 address of the source DNS server
+    /// (Optional) IPv4 address of the source DNS server
     #[structopt(short="s")]
     source_ipaddr: Option<String>,
 
