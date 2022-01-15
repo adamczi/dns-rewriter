@@ -4,6 +4,7 @@ use std::net::Ipv4Addr;
 use std::collections::HashMap;
 use std::io::Error;
 use std::thread;
+use std::fs;
 use structopt::StructOpt;
 use pnet::packet::ip::{IpNextHeaderProtocol, IpNextHeaderProtocols};
 use pnet::packet::ipv4::{Ipv4Packet,MutableIpv4Packet, checksum};
@@ -13,6 +14,7 @@ extern crate nfqueue;
 extern crate libc;
 extern crate iptables;
 extern crate signal_hook;
+extern crate resolv_conf;
 
 #[derive(StructOpt, Debug)]
 #[structopt()]
@@ -23,7 +25,7 @@ struct Opt {
 
     /// IPv4 address of the source DNS server
     #[structopt(short="s")]
-    source_ipaddr: String,
+    source_ipaddr: Option<String>,
 
     /// Verbose mode. When not verbose '.' (dot) means non-DNS packet and 'X' means unhandled DNS packet
     #[structopt(short="v", long="verbose")]
@@ -101,7 +103,7 @@ fn validate_ipv4(ipv4address: String) -> [u8; 4] {
             ipv4.octets()
         }
         Err(e) => {
-            println!("Error: {}", e);
+            println!("Error: {} - {}", ipv4address, e);
             std::process::exit(1)
         }
     }
@@ -438,19 +440,21 @@ fn set_queue(ipt: &iptables::IPTables, addr: &[u8; 4]) -> Option<u16> {
     None
 }
 
-fn cleanup_queue(addr: &[u8; 4], queue_num: u16) {
+fn cleanup_queue(dns_list: &Vec<[u8; 4]>, queue_num: u16) {
     let ipt = iptables::new(false).unwrap();
-    let options = format!("--source {}.{}.{}.{} -j NFQUEUE --queue-num {}", addr[0],addr[1],addr[2],addr[3], queue_num);
-    println!("Cleaning up {}", options);
-    if ipt.exists("filter", "INPUT", options.as_str()).unwrap() {
-        ipt.delete("filter", "INPUT", options.as_str()).unwrap();
-    }
-    else {
-        println!("nfqueue: INPUT filter not found, clean it up yourself: \"iptables -D INPUT {}\"", options);
+    for ipaddr in dns_list {
+        let options = format!("--source {}.{}.{}.{} -j NFQUEUE --queue-num {}", ipaddr[0],ipaddr[1],ipaddr[2],ipaddr[3], queue_num);
+        println!("Cleaning up {}", options);
+        if ipt.exists("filter", "INPUT", options.as_str()).unwrap() {
+            ipt.delete("filter", "INPUT", options.as_str()).unwrap();
+        }
+        else {
+            println!("nfqueue: INPUT filter not found, clean it up yourself: \"iptables -D INPUT {}\"", options);
+        }
     }
 }
 
-fn register_signals(addr: [u8; 4], queue_num: u16) -> Result<(), Error> {
+fn register_signals(dns_list: Vec<[u8; 4]>, queue_num: u16) -> Result<(), Error> {
     // Listen for signals, then clean up iptables rule on exit
     let mut signals = signal_hook::iterator::Signals::new(&[
         signal_hook::consts::SIGINT, // ctrl+c
@@ -464,7 +468,7 @@ fn register_signals(addr: [u8; 4], queue_num: u16) -> Result<(), Error> {
             match sig {
                 2 | 3 | 15 => {
                     // SIGINT, SIGQUIT, SIGTERM
-                    cleanup_queue(&addr.to_owned(), queue_num);
+                    cleanup_queue(&dns_list.to_owned(), queue_num);
                     std::process::exit(0)
                 },
                 _ => {
@@ -477,16 +481,38 @@ fn register_signals(addr: [u8; 4], queue_num: u16) -> Result<(), Error> {
     Ok(())
 }
 
+fn get_current_dns(ipv4address: Option<String>) -> Vec<[u8; 4]> {
+    // Return list of used DNS servers from system config
+    // If `-s` flag is provided, use this address instead of system-configured ones
+    match ipv4address {
+        Some(s) => return vec![validate_ipv4(s)],
+        None => {
+            let contents = fs::read_to_string("/etc/resolv.conf").expect("Failed to open resolv.conf");
+            let config = resolv_conf::Config::parse(&contents).unwrap();
+            let mut ips: Vec<[u8; 4]> = Vec::new();
+            for ip in config.nameservers {
+                ips.push(validate_ipv4(ip.to_string()));
+            }
+            return ips
+        }
+    }
+
+}
+
 fn main() {
     let opt = Opt::from_args();
     let target_ipv4_address = validate_ipv4(opt.target_ipaddr);
-    let source_ipv4_address = validate_ipv4(opt.source_ipaddr);
+    let dns_ipv4_addresses = get_current_dns(opt.source_ipaddr);
+   
     let ipt = iptables::new(false).unwrap();
-    let queue_num = set_queue(&ipt, &source_ipv4_address);
-    
+    let mut queue_num: Option<u16> = None;
+    for dns_ipv4_addr in dns_ipv4_addresses.to_owned() {
+        queue_num = set_queue(&ipt, &dns_ipv4_addr);
+    }
+
     match queue_num {
         Some(queue_num) => {
-            match register_signals(source_ipv4_address, queue_num) {
+            match register_signals(dns_ipv4_addresses, queue_num) {
                 Ok(()) => {
                     let qtypes: HashMap<i32, &str> = QTYPES_MAP.iter().cloned().collect();
                     let mut q = nfqueue::Queue::new((State::new(), target_ipv4_address.to_owned(), qtypes));
