@@ -5,7 +5,7 @@ shitty code yet, but works as a PoC
 
 Tool that substitutes IPv4 addresses in DNS responses. Run it with a chosen IPv4 address and make your applications receive different IP for each of their queries. As this modifies responses not requests, original values remain in DNS servers' logs.
 
-As for now it only supports modification of "A" DNS responses into a single IP address. Also UDP only. Requires support of netfilter queues in the OS (Linux mainly, tested on 5.10.*) and optionally resolvconf.
+As for now it only supports modification of "A" DNS responses. Also UDP only. Requires support of netfilter queues in the OS (Linux mainly, tested on 5.10.*) and optionally resolvconf.
 
 Requires CAP_NET_ADMIN on Linux, for testing can be quickly granted with simple `sudo`.
 
@@ -13,9 +13,9 @@ This program picks up current DNS servers from `/etc/resolv.conf` file. If this 
 
 ## How to:
 
-Step 1) run dns-rewriter. Pass `-t <IPv4 address>` that will be included in every DNS response:
+Step 1) run dns-rewriter. Pass `-t <domain>=<IPv4 address>` that will be included in every DNS response:
 
-    sudo ./dns-rewriter -t 1.2.3.4
+    sudo ./dns-rewriter -t example.com=1.2.3.4
 
 Step 2) test with some DNS tool like dig or nslookup:
 
@@ -31,12 +31,12 @@ Step 3) observe modified responses:
     Name:   example.com
     Address: 1.2.3.4
 
-Program will clean up `iptables` rules on exit automatically, provided it exits using SIGINT (regular ctrl+c), SIGQUIT or SIGTERM.
+To pass more than one domain-IP pair, separate them with colon`,` for example `-t example.com=1.2.3.4,hello.net=2.3.4.5`. Program will clean up `iptables` rules on exit automatically, provided it exits using SIGINT (regular ctrl+c), SIGQUIT or SIGTERM.
 
 ### I don't want to modify all responses, just from one DNS server:
 This is what `-s` switch is here for. Run
 
-    sudo ./dns-rewriter -t 1.2.3.4 -s 9.9.9.9
+    sudo ./dns-rewriter -t example.com=1.2.3.4 -s 9.9.9.9
 
 and only responses coming from DNS server at 9.9.9.9 will be modified.
 
@@ -51,7 +51,7 @@ Try to compile on your OS:
     dns-rewriter 0.1.0
 
     USAGE:
-        dns-rewriter [FLAGS] [OPTIONS] -t <target-ipaddr>
+        dns-rewriter [FLAGS] [OPTIONS] -t <target-addrs>
 
     FLAGS:
         -h, --help       Prints help information
@@ -60,4 +60,4 @@ Try to compile on your OS:
 
     OPTIONS:
         -s <source-ipaddr>        (Optional) IPv4 address of the source DNS server
-        -t <target-ipaddr>        IPv4 address to be set in the DNS response
+        -t <target-addrs>         Domain and IPv4 pairs separated by colon, e.g. example.com=1.2.3.4,hello.net=2.3.4.5

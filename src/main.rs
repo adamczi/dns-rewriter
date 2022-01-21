@@ -19,9 +19,9 @@ extern crate resolv_conf;
 #[derive(StructOpt, Debug)]
 #[structopt()]
 struct Opt {
-    /// IPv4 address to be set in the DNS response
+    /// Domain and IPv4 pairs separated by colon, e.g. example.com=1.2.3.4,hello.net=2.3.4.5
     #[structopt(short="t")]
-    target_ipaddr: String,
+    target_addrs: String,
 
     /// (Optional) IPv4 address of the source DNS server
     #[structopt(short="s")]
@@ -95,16 +95,32 @@ const QTYPES_MAP: [(i32, &str); 47] = [
     (32769, "DLV")
 ];
 
-fn validate_ipv4(ipv4address: String) -> [u8; 4] {
+fn extract_targets<'a>(targets: &'a String) -> HashMap<&'a str, [u8; 4]> {
+    let mut targets_map = HashMap::new();
+    for pair in targets.split(",") {
+        let pair_vec: Vec<&str> = pair.split("=").collect();
+        match validate_ipv4(pair_vec[1].to_string()) {
+            Ok(i) => {
+                targets_map.insert(pair_vec[0], i);
+            },
+            Err(_) => {
+
+            }
+        }
+    }
+    targets_map
+}
+
+fn validate_ipv4(ipv4address: String) -> Result<[u8; 4], std::net::AddrParseError> {
     // Validate passed arg against IPv4. Returns array with 4 octets or terminates program
     let ipv4 = ipv4address.parse::<Ipv4Addr>();
     match ipv4 {
         Ok(ipv4) => {
-            ipv4.octets()
+            Ok(ipv4.octets())
         }
         Err(e) => {
             println!("Error: {} - {}", ipv4address, e);
-            std::process::exit(1)
+            return Err(e)
         }
     }
 
@@ -146,13 +162,13 @@ fn guess_if_dns(udp_data: &[u8], udp_port: u16) -> bool {
     true
 }
 
-fn print_domain(domain: &[u8]) {
-    let mut s: String = String::from("");
-    for c in domain {
-        s.push(*c as char);
-    }
-    println!("{}",s);
-}
+// fn print_domain(domain: &[u8]) {
+//     let mut s: String = String::from("");
+//     for c in domain {
+//         s.push(*c as char);
+//     }
+//     println!("{}",s);
+// }
 
 fn get_query_type(_first_byte: Option<&u8>, second_byte: Option<&u8>, qtypes: &HashMap<i32, &str>) -> (bool, String) {
     // Extract DNS query/response type from the static list. `first_byte` remains here as 'todo' in case
@@ -184,7 +200,7 @@ fn get_query_type(_first_byte: Option<&u8>, second_byte: Option<&u8>, qtypes: &H
 }
 
 fn print_packet(
-    queried_domain: &[u8],
+    queried_domain: &str,
     req_qt_msg: &str,
     resp_qt_msg: &str,
     payload: &[u8],
@@ -193,7 +209,7 @@ fn print_packet(
 ) {
     if Opt::from_args().verbose {
         println!("------\nRequest");
-        print_domain(queried_domain);
+        println!("{}", queried_domain);
         println!("{}", req_qt_msg);
         println!("\nResponse");
         println!("{}", resp_qt_msg);
@@ -211,7 +227,7 @@ fn print_packet(
     );
 }
 
-fn substitute_addr(payload: std::vec::Vec<u8>, new_ipv4_addr: [u8; 4], qtypes: HashMap<i32, &str>) -> Option<std::vec::Vec<u8>> {
+fn substitute_addr(payload: std::vec::Vec<u8>, targets: HashMap<&str, [u8; 4]>, qtypes: HashMap<i32, &str>) -> Option<std::vec::Vec<u8>> {
     // Resolved IP address position in payload depends on for example the length
     // of the domain queried. We will have to calculate this position first, then
     // substitute the address.
@@ -272,27 +288,48 @@ fn substitute_addr(payload: std::vec::Vec<u8>, new_ipv4_addr: [u8; 4], qtypes: H
     // Find out current index and substitute IP address
     let itersize = payload_iter.size_hint();
     let mut new_dns_body = payload.to_owned();
-    new_dns_body[payload.len()-itersize.0] = new_ipv4_addr[0];
-    new_dns_body[payload.len()-itersize.0+1] = new_ipv4_addr[1];
-    new_dns_body[payload.len()-itersize.0+2] = new_ipv4_addr[2];
-    new_dns_body[payload.len()-itersize.0+3] = new_ipv4_addr[3];
+    // Remove trailing dot from the domain, such as example.com. <-- this one
+    queried_domain.pop();
+    match std::str::from_utf8(&queried_domain) {
+        Ok(d) => {
+            match targets.get(&d) {
+                Some(&new_ipv4_addr) => {
+                    // Actual substitution
+                    new_dns_body[payload.len()-itersize.0] = new_ipv4_addr[0];
+                    new_dns_body[payload.len()-itersize.0+1] = new_ipv4_addr[1];
+                    new_dns_body[payload.len()-itersize.0+2] = new_ipv4_addr[2];
+                    new_dns_body[payload.len()-itersize.0+3] = new_ipv4_addr[3];
+                    
+                    print_packet(
+                        &d,
+                        &request_qt.1,
+                        &response_qt.1,
+                        &payload,
+                        &new_ipv4_addr,
+                        &itersize
+                    );
+                    Some(new_dns_body)
+                }
+                None => {
+                    if Opt::from_args().verbose {
+                        println!("Domain {} not specified for a change", d);
+                    }
+                    None
+                }
+            }    
+        }
+        _ => {
+            println!("{:?} is not valid domain", queried_domain);
+            None
+        }
+    }
 
-    print_packet(
-        &queried_domain,
-        &request_qt.1,
-        &response_qt.1,
-        &payload,
-        &new_ipv4_addr,
-        &itersize
-    );
-    
-    Some(new_dns_body)
 }
 
 // TODO: TCP handling
 // fn handle_tcp_packet(id: u32, source: Ipv4Addr, destination: Ipv4Addr, packet: &[u8]) -> MutableTcpPacket {}
 
-fn handle_udp_packet<'a>(id: u32, source: Ipv4Addr, destination: Ipv4Addr, packet: &'a[u8], new_ipv4_address: [u8; 4], qtypes: HashMap<i32, &str>) -> Option<MutableUdpPacket<'a>> {
+fn handle_udp_packet<'a>(id: u32, source: Ipv4Addr, destination: Ipv4Addr, packet: &'a[u8], targets: HashMap<&str, [u8; 4]>, qtypes: HashMap<i32, &str>) -> Option<MutableUdpPacket<'a>> {
     let mut s_packet_data = packet.to_owned();
     let ms_packet_data = s_packet_data.as_mut_slice();
     let udp = MutableUdpPacket::new(ms_packet_data);
@@ -313,7 +350,7 @@ fn handle_udp_packet<'a>(id: u32, source: Ipv4Addr, destination: Ipv4Addr, packe
         };
 
         // Do actual substitutions here and obtain new body to return
-        match substitute_addr(u.payload().to_owned(), new_ipv4_address, qtypes) {
+        match substitute_addr(u.payload().to_owned(), targets, qtypes) {
             Some(new_dns_body) => {
                 // Prepare new UDP packet and fill header with previous data
                 let mut nudp = MutableUdpPacket::owned(new_data).unwrap();
@@ -342,12 +379,12 @@ fn handle_transport_protocol<'a>(
     destination: Ipv4Addr,
     protocol: IpNextHeaderProtocol,
     packet: &'a[u8],
-    new_ipv4_address: [u8; 4],
+    targets: HashMap<&str, [u8; 4]>,
     qtypes: HashMap<i32, &str>
 ) -> Option<MutableUdpPacket<'a>> {
     match protocol {
         IpNextHeaderProtocols::Udp => {
-            handle_udp_packet(id, source, destination, packet, new_ipv4_address, qtypes)
+            handle_udp_packet(id, source, destination, packet, targets, qtypes)
         },
         // IpNextHeaderProtocols::Tcp => handle_tcp_packet(id, source, destination, packet),
         _ => {
@@ -371,8 +408,8 @@ fn handle_transport_protocol<'a>(
 }
 
 
-fn callback(msg: &nfqueue::Message, custom_data: &mut (State, [u8; 4], HashMap<i32, &str>)) {
-    let (state, new_ipv4_address, qtypes) = custom_data;
+fn callback(msg: &nfqueue::Message, custom_data: &mut (State, HashMap<&str, [u8; 4]>, HashMap<i32, &str>)) {
+    let (state, targets, qtypes) = custom_data;
     state.count += 1;
     // println!(" -> {} msg: {}", msg.get_id(), msg);
 
@@ -385,7 +422,7 @@ fn callback(msg: &nfqueue::Message, custom_data: &mut (State, [u8; 4], HashMap<i
                 h.get_destination(),
                 h.get_next_level_protocol(),
                 h.payload(),
-                new_ipv4_address.to_owned(),
+                targets.to_owned(),
                 qtypes.to_owned()
             );
 
@@ -485,13 +522,27 @@ fn get_current_dns(ipv4address: Option<String>) -> Vec<[u8; 4]> {
     // Return list of used DNS servers from system config
     // If `-s` flag is provided, use this address instead of system-configured ones
     match ipv4address {
-        Some(s) => return vec![validate_ipv4(s)],
+        Some(s) => { 
+            match validate_ipv4(s) {
+                Ok(ss) => return vec![ss],
+                _ => {
+                    std::process::exit(1)
+                }
+            }
+        }
         None => {
             let contents = fs::read_to_string("/etc/resolv.conf").expect("Failed to open resolv.conf");
             let config = resolv_conf::Config::parse(&contents).unwrap();
             let mut ips: Vec<[u8; 4]> = Vec::new();
             for ip in config.nameservers {
-                ips.push(validate_ipv4(ip.to_string()));
+                match validate_ipv4(ip.to_string()) {
+                    Err(_) => {
+                    println!("Error adding nfqueue for DNS {}", ip.to_string());
+                    },
+                    Ok(i) => {
+                        ips.push(i);
+                    }
+                }
             }
             return ips
         }
@@ -501,7 +552,8 @@ fn get_current_dns(ipv4address: Option<String>) -> Vec<[u8; 4]> {
 
 fn main() {
     let opt = Opt::from_args();
-    let target_ipv4_address = validate_ipv4(opt.target_ipaddr);
+    let targets = extract_targets(&opt.target_addrs);
+    println!("TARGETS: {:?}", targets);
     let dns_ipv4_addresses = get_current_dns(opt.source_ipaddr);
    
     let ipt = iptables::new(false).unwrap();
@@ -515,7 +567,7 @@ fn main() {
             match register_signals(dns_ipv4_addresses, queue_num) {
                 Ok(()) => {
                     let qtypes: HashMap<i32, &str> = QTYPES_MAP.iter().cloned().collect();
-                    let mut q = nfqueue::Queue::new((State::new(), target_ipv4_address.to_owned(), qtypes));
+                    let mut q = nfqueue::Queue::new((State::new(), targets.to_owned(), qtypes));
                     q.open();
                     let rc = q.bind(libc::AF_INET);
                     assert!(rc==0);
